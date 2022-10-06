@@ -7,7 +7,10 @@
 static const size_t prob_bits = 24;
 static const size_t prob_scale = 1 << prob_bits;
 
-typedef struct {
+typedef struct symbol_enc_node;
+typedef struct symbol_dec_node;
+
+struct symbol_enc_node{
 	bool isLeaf;
 	symbol_enc_node* left;
 	symbol_enc_node* right;
@@ -15,9 +18,9 @@ typedef struct {
 	uint32_t cum_freq;
 	uint32_t range;
 	Rans64EncSymbol esym;
-} symbol_enc_node;
+};
 
-typedef struct {
+struct symbol_dec_node{
 	bool isLeaf;
 	symbol_dec_node* left;
 	symbol_dec_node* right;
@@ -25,10 +28,10 @@ typedef struct {
 	uint32_t cum_freq;
 	uint32_t range;
 	Rans64DecSymbol dsym;
-} symbol_dec_node;
+};
 
 typedef struct {
-	uint8_t context_mode;
+	uint8_t mode;
 	uint32_t range;
 	bool list_mode;
 	symbol_enc_node* root;
@@ -36,7 +39,7 @@ typedef struct {
 } vANS_enc_context;
 
 typedef struct {
-	uint8_t context_mode;
+	uint8_t mode;
 	uint32_t range;
 	bool list_mode;
 	symbol_dec_node* root;
@@ -78,36 +81,16 @@ struct vANS_stats{
 	void remove(uint32_t value);
 };
 
-size_t symbol_quant(value){
+size_t symbol_quant(uint32_t value){
 	return value;//TODO quant
 }
 
-double symbol_cost(value){
+double symbol_cost(uint32_t value){
 	return std::log2(value) * value;
 }
 
-double symbol_cost_quant(value,quant){
+double symbol_cost_quant(uint32_t value,uint32_t quant){
 	return value;//TODO closed form
-}
-
-vANS_recursive_build_context(
-	vANS_stats_dynamic_node* tree,
-	symbol_enc_node* root,
-	size_t total,
-	size_t running_total,
-	size_t scaled_total
-){
-	if(*tree.isLeaf){
-		*root.isLeaf = true;
-		*root.left = new symbol_enc_node;
-		*root.right = new symbol_enc_node;
-		vANS_recursive_build_context(stats.tree.left, &context.root.left, total, running_total, scaled_total);
-		vANS_recursive_build_context(stats.tree.right, &context.root.right, total, running_total, scaled_total);
-	}
-	else{
-		*root.isLeaf = false;
-		//TODO scale freq in leaf node
-	}
 }
 	
 
@@ -116,7 +99,68 @@ vANS_enc_context create_enc_tree(vANS_stats stats){
 	context.mode = stats.mode;
 	context.range = stats.range;
 	if(context.mode){
-		vANS_recursive_build_context(stats.tree, &context.root, stats.total, 0, 0);
+		size_t quant_total = 0;
+		vANS_stats_dynamic_node* trace[32];
+		bool sinistral[32];
+		size_t depth = 0;
+		trace[0] = stats.tree;
+		while(depth || sinistral[0]){
+			if((*trace[depth]).isLeaf){
+				(*trace[depth]).count = symbol_quant((*trace[depth]).count);
+				quant_total += (*trace[depth]).count;
+				do{
+					depth--;
+				}while(depth && !sinistral[depth]);
+				if(!depth && !sinistral[depth]){
+					break;
+				}
+				trace[depth + 1] = (*trace[depth]).right;
+				sinistral[depth] = false;
+			}
+			else{
+				trace[depth + 1] = (*trace[depth]).left;
+				sinistral[depth] = true;
+			}
+			depth++;
+		}
+
+		depth = 0;
+		symbol_enc_node* trace2[32];
+		trace2[0] = context.root;
+		size_t running_total = 0;
+		size_t scaled_total = 0;
+		while(depth || sinistral[0]){
+			if((*trace[depth]).isLeaf){
+				running_total += (*trace[depth]).count;
+				scaled_total = ((uint64_t)prob_scale * (uint32_t)running_total)/((uint32_t)quant_total);
+				(*trace2[depth]).isLeaf = true;
+				(*trace2[depth]).base_val = i;
+				(*trace2[depth]).cum_freq = scaled_total;
+				(*trace2[depth]).range = (*trace[depth]).range;
+				Rans64EncSymbolInit(
+					&(*trace2[depth]).esym,
+					(*trace2[depth]).cum_freq,
+					scaled_total - (*trace2[depth]),
+					prob_bits
+				);
+				do{
+					depth--;
+				}while(depth && !sinistral[depth]);
+				if(!depth && !sinistral[depth]){
+					break;
+				}
+				trace[depth + 1] = (*trace[depth]).right;
+				trace2[depth + 1] = (*trace2[depth]).right;
+				sinistral[depth] = false;
+			}
+			else{
+				(*trace2[depth]).isLeaf = false;
+				trace[depth + 1] = (*trace[depth]).left;
+				trace2[depth + 1] = (*trace2[depth]).left;
+				sinistral[depth] = true;
+			}
+			depth++;
+		}
 	}
 	else{
 		context.list_root = new symbol_enc_node[stats.range];
@@ -126,7 +170,7 @@ vANS_enc_context create_enc_tree(vANS_stats stats){
 			context.list_root[i].isLeaf = true;
 			context.list_root[i].base_val = i;
 			context.list_root[i].cum_freq = scaled_total;
-			running_total += symbol_quant(stats.list[i]);
+			running_total += symbol_quant(stats.list[i].count);
 			scaled_total = ((uint64_t)prob_scale * (uint32_t)running_total)/((uint32_t)stats.total);
 			context.list_root[i].range = 1;
 			Rans64EncSymbolInit(
@@ -139,7 +183,7 @@ vANS_enc_context create_enc_tree(vANS_stats stats){
 	}
 }
 
-vANS_stats::init(uint32_t n){
+void vANS_stats::init(uint32_t n){
 	range = n;
 	total = 0;
 	if(range < (1<<16)){
@@ -162,8 +206,7 @@ vANS_stats::init(uint32_t n){
 	}
 }
 
-vANS_stats::add(uint32_t val){
-	count++;
+void vANS_stats::add(uint32_t val){
 	if(mode){
 		vANS_stats_dynamic_node* root = tree;
 		while(root->range > 1){
@@ -176,7 +219,7 @@ vANS_stats::add(uint32_t val){
 				left->isLeaf = true;
 				right->isLeaf = true;
 				left->base_val = root->base_val;
-				rigth->base_val = root->base_val + new_range;
+				right->base_val = root->base_val + new_range;
 				left->count = 0;
 				right->count = 0;
 				left->range = new_range;
@@ -254,7 +297,7 @@ uint32_t* vANS_flush(
 	vANS_state& vANS
 ){
 	Rans64EncFlush(vANS.rans_state, vANS.data);
-	vANS_writeBits(1,1);
+	vANS_writeBits(1,1,vANS);
 	*(--vANS.data) = vANS.buffer << (32 - vANS.buffer_size);
 	return vANS.data;
 }
