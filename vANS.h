@@ -4,9 +4,6 @@
 #include <cmath>
 #include <math.h>
 
-static const size_t prob_bits = 24;
-static const size_t prob_scale = 1 << prob_bits;
-
 typedef struct symbol_enc_node;
 typedef struct symbol_dec_node;
 
@@ -16,6 +13,7 @@ struct symbol_enc_node{
 	symbol_enc_node* right;
 	uint32_t base_val;
 	uint32_t cum_freq;
+	uint32_t freq;
 	uint32_t range;
 	Rans64EncSymbol esym;
 };
@@ -94,11 +92,13 @@ double symbol_cost_quant(uint32_t value,uint32_t quant){
 }
 	
 
-vANS_enc_context create_enc_tree(vANS_stats stats){
+vANS_enc_context vANS_create_context(vANS_stats stats, vANS_state vANS){
 	vANS_enc_context context;
 	context.mode = stats.mode;
 	context.range = stats.range;
+	//printf("%d\n",(int)stats.total);
 	if(context.mode){
+/*
 		size_t quant_total = 0;
 		vANS_stats_dynamic_node* trace[32];
 		bool sinistral[32];
@@ -161,26 +161,33 @@ vANS_enc_context create_enc_tree(vANS_stats stats){
 			}
 			depth++;
 		}
+*/
 	}
 	else{
 		context.list_root = new symbol_enc_node[stats.range];
 		size_t running_total = 0;
 		size_t scaled_total = 0;
+		size_t stats_total = 0;
+		for(size_t i=0;i<stats.range;i++){
+			stats_total += symbol_quant(stats.list[i]);
+		}
 		for(size_t i=0;i<stats.range;i++){
 			context.list_root[i].isLeaf = true;
 			context.list_root[i].base_val = i;
 			context.list_root[i].cum_freq = scaled_total;
-			running_total += symbol_quant(stats.list[i].count);
-			scaled_total = ((uint64_t)prob_scale * (uint32_t)running_total)/((uint32_t)stats.total);
+			running_total += symbol_quant(stats.list[i]);
+			scaled_total = ((uint64_t)vANS.prob_scale * (uint32_t)running_total)/((uint32_t)stats_total);
+			context.list_root[i].freq = stats.list[i];
 			context.list_root[i].range = 1;
 			Rans64EncSymbolInit(
 				&context.list_root[i].esym,
 				context.list_root[i].cum_freq,
 				scaled_total - context.list_root[i].cum_freq,
-				prob_bits
+				vANS.prob_bits
 			);
 		}
 	}
+	return context;
 }
 
 void vANS_stats::init(uint32_t n){
@@ -202,7 +209,7 @@ void vANS_stats::init(uint32_t n){
 			halver = halver>>1;
 			stat->range = stat->range<<1;
 		}
-		list = stat;
+		tree = stat;
 	}
 }
 
@@ -225,7 +232,7 @@ void vANS_stats::add(uint32_t val){
 				left->range = new_range;
 				right->range = new_range;
 			}
-			if(val < root->range.right->base_val){
+			if(val < root->right->base_val){
 				root = root->right;
 			}
 			else{
@@ -237,6 +244,7 @@ void vANS_stats::add(uint32_t val){
 	else{
 		list[val]++;
 	}
+	total++;
 }
 
 uint32_t vANS_readBits(
@@ -257,16 +265,32 @@ uint32_t vANS_readBits(
 }
 
 uint32_t vANS_readSymbol(
-	vANS_context& context,
+	vANS_dec_context& context,
 	vANS_state& vANS
 ){
 }
 
 uint32_t vANS_writeSymbol(
 	uint32_t value,
-	vANS_context& context,
+	vANS_enc_context& context,
 	vANS_state& vANS
 ){
+	//printf("value %d\n",value);
+	if(context.list_root[value].freq == 0){
+		printf("uh oh... (%d,%d)\n",(int)value,(int)context.list_root[value].freq);
+		return 1;
+	}
+	if(context.mode){
+	}
+	else{
+		Rans64EncPutSymbol(
+			&vANS.rans_state,
+			&vANS.data,
+			&(context.list_root[value].esym),
+			vANS.prob_bits
+		);
+	}
+	return 0;
 }
 
 	
@@ -288,7 +312,7 @@ void vANS_writeBits(
 	} 
 }
 
-vANS_writeContext(
+void vANS_writeContext(
 	vANS_enc_context context,
 	vANS_state& vANS){
 }
@@ -296,17 +320,33 @@ vANS_writeContext(
 uint32_t* vANS_flush(
 	vANS_state& vANS
 ){
-	Rans64EncFlush(vANS.rans_state, vANS.data);
+	Rans64EncFlush(&vANS.rans_state, &vANS.data);
 	vANS_writeBits(1,1,vANS);
 	*(--vANS.data) = vANS.buffer << (32 - vANS.buffer_size);
 	return vANS.data;
 }
 
-vANS_state vANS_init_read(
-	uint32_t* data_end,
+vANS_state vANS_state_init(
 	uint32_t* data_start,
+	uint32_t* data_end
 ){
-	vANS_state vANS = new vANS_state;
+	vANS_state vANS;
+	vANS.data_end = data_end;
+	vANS.data_start = data_start;
+	vANS.data = data_end;
+	vANS.buffer = 0;
+	vANS.buffer_size = 32;
+	vANS.prob_bits = 20;
+	vANS.prob_scale = 1 << 20;
+	Rans64EncInit(&(vANS.rans_state));
+	return vANS;
+}
+
+vANS_state vANS_dec_init(
+	uint32_t* data_start,
+	uint32_t* data_end
+){
+	vANS_state vANS;
 	vANS.data_end = data_end;
 	vANS.data_start = data_start;
 	vANS.data = data_start;
@@ -316,4 +356,5 @@ vANS_state vANS_init_read(
 		//remove padding
 	}
 	//TODO init rans state
+	return vANS;
 }
